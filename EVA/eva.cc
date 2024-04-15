@@ -3,6 +3,7 @@
 #include <map>
 #include <vector>
 #include <iostream>
+#include <random>
 #include <cstdint>
 #include <bitset>
 #include <tuple>
@@ -10,17 +11,17 @@
 
 namespace
 {
-const uint32_t k = 7; // Define the constant 2^k for age granularity
+const uint32_t k = 14; // Define the constant 2^k for age granularity
 const uint32_t size = 2 * (1 << (k + 1));
 const int NUM_SETS = 2048; // Number of sets in the cache
 const int NUM_WAYS = 16; // Number of ways (cache lines) per set
-const int AGE_BITS = 7; // Number of bits for age counter
+const int AGE_BITS = 14; // Number of bits for age counter
 const int TIMESTAMP_BITS = 7; // Number of bits for timestamp counter
 const int AGE_GRANULARITY = 15; // Age granularity (limit A)
 const int MAX_AGE_VALUE = 2 * (1 << (k + 1)); // Maximum value for age counter
 std::map<CACHE*, std::vector<uint64_t>> last_used_cycles;
-double hitCtrs_nn[NUM_SETS][MAX_AGE_VALUE][2] = {{0.0}};
-double evictionCtrs_nn[NUM_SETS][MAX_AGE_VALUE][2] = {{0.0}};
+double hitCtrs_nn[MAX_AGE_VALUE][2] = {{0.0}};
+double evictionCtrs_nn[MAX_AGE_VALUE][2] = {{0.0}};
 int evafg = 0;
 }
 
@@ -113,7 +114,7 @@ public:
 };
 
 // Function to compute EVA and update ranks
-std::vector<double> computeEVAandUpdateRanks(double hitCtrs[][MAX_AGE_VALUE][2], double evictionCtrs[][MAX_AGE_VALUE][2], double A, double N) {
+std::vector<double> computeEVAandUpdateRanks(double hitCtrs[MAX_AGE_VALUE][2], double evictionCtrs[MAX_AGE_VALUE][2], double A, double N) {
     // Initialize variables
     std::vector<double> rank(2 * (1 << (k + 1)));
     std::vector<double> hR(2 * (1 << (k + 1)));
@@ -122,19 +123,19 @@ std::vector<double> computeEVAandUpdateRanks(double hitCtrs[][MAX_AGE_VALUE][2],
     std::vector<double> eventNR(2 * (1 << (k + 1)));
 
     // Compute hit rates from counters
-    for (int set = 0; set < NUM_SETS; set++) {
+    // for (int set = 0; set < NUM_SETS; set++) {
         for (int age = 1; age <= MAX_AGE_VALUE; age++) {
             for (int c = 0; c < 2; c++) { // 0 - NotReused; 1 - Reused
                 if (c == 0) {
-                    hNR[age] += hitCtrs[set][age][c];
-                    eventNR[age] += hitCtrs[set][age][c] + evictionCtrs[set][age][c];
+                    hNR[age] += hitCtrs[age][c];
+                    eventNR[age] += hitCtrs[age][c] + evictionCtrs[age][c];
                 } else {
-                    hR[age] += hitCtrs[set][age][c];
-                    eventR[age] += hitCtrs[set][age][c] + evictionCtrs[set][age][c];
+                    hR[age] += hitCtrs[age][c];
+                    eventR[age] += hitCtrs[age][c] + evictionCtrs[age][c];
                 }
             }
         }
-    }
+    // }
 
     // Calculate hit rates
     for (int age = 1; age <= MAX_AGE_VALUE; age++) {
@@ -194,7 +195,6 @@ std::vector<double> computeEVAandUpdateRanks(double hitCtrs[][MAX_AGE_VALUE][2],
 Cache_Age cache_age;
 
 void CACHE::initialize_replacement() { 
-    ::last_used_cycles[this] = std::vector<uint64_t>(NUM_SETS * NUM_WAYS); 
 }
 
 uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
@@ -203,23 +203,37 @@ uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t
     double N = 8;
     // double evictionarray[NUM_SETS] = {0};
     std::vector<double> rank = computeEVAandUpdateRanks(hitCtrs_nn, evictionCtrs_nn, AGE_GRANULARITY, N);
-    // std::cout << "Value of set " << set << std::endl; 
-    cache_age.printCacheStatus(set);
-    // std::cout << "Ranking:\n";
-    // for (double i = 0; i <= (2 * (1 << (k + 1)))-1; i++) {
-    //     std::cout << "Age " << i << ": " << rank[i] << std::endl;
-    // }
-    // Find the way with the lowest rank
-    auto minRankIndex = std::min_element(rank.begin(), rank.end());
-    assert(minRankIndex != rank.end()); // Ensure the minimum element exists
+    
+    // Select 10 random candidates from NUM_SETS
+    std::vector<uint32_t> candidate_indices;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint32_t> dis(0, NUM_SETS - 1);
+    for (int i = 0; i < 10; ++i) {
+        candidate_indices.push_back(dis(gen));
+    }
 
-    // Calculate the index of the victim
-    uint32_t victimIndex = static_cast<uint32_t>(std::distance(rank.begin(), minRankIndex));
-    // Update eviction counters
+    // Find the way with the lowest rank among the randomly selected candidates
+    double minRank = std::numeric_limits<double>::max();
+    uint32_t victimIndex = 0;
+    for (const auto& candidate : candidate_indices) {
+        auto [ageCounter, classificationBit, timestamp] = cache_age.getCacheLineInfo(set, candidate);
+        double candidateRank = rank[ageCounter];
+        if (candidateRank < minRank) {
+            minRank = candidateRank;
+            victimIndex = candidate;
+        }
+    }
+
+    assert(victimIndex < NUM_SETS); // Ensure the victim index is within bounds
+
+    // Update eviction counters for the selected victim
     auto [ageCounter, classificationBit, timestamp] = cache_age.getCacheLineInfo(set, victimIndex);
-    evictionCtrs_nn[set][ageCounter][classificationBit]++;
+    evictionCtrs_nn[ageCounter][classificationBit]++;
     cache_age.accessCache(set, victimIndex, false, true); // Access set 0, way 1, with a hit, evict, call after all calc done
-    std::cout << "Value of victim " << victimIndex << std::endl; 
+    
+    // std::cout << "Value of victim " << victimIndex << std::endl;
+    
     return victimIndex;
 }
 
@@ -231,7 +245,7 @@ void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint
   bool hit_age = false; 
   if(hit && access_type{type} != access_type::WRITE){ // If hit and skip for witeback hits
       auto [ageCounter, classificationBit, timestamp] = cache_age.getCacheLineInfo(set, way);
-      hitCtrs_nn[set][ageCounter][classificationBit]++; // increment R
+      hitCtrs_nn[ageCounter][classificationBit]++; // increment R
       hit_age = true;
   }
   cache_age.accessCache(set, way, hit_age, false); // Access set 0, way 1, with a hit, evict, call after all calc done
